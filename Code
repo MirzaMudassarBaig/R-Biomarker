@@ -1,0 +1,387 @@
+# ============================================================
+# Cervical Cancer Pipeline (GSE63514 + TCGA-CESC) — ANO10 study
+# Full script: raw data -> figures + tables
+# R version: 4.5.1
+# ============================================================
+
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+# -----------------------------
+# 0) Packages (simple)
+# -----------------------------
+install_if_missing <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      install.packages(p, repos = "https://cloud.r-project.org")
+    }
+  }
+}
+
+# CRAN
+install_if_missing(c(
+  "data.table","dplyr","tidyr","stringr","ggplot2","readr","tibble",
+  "pROC","survival","survminer"
+))
+
+# Bioc
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+bioc_pkgs <- c(
+  "DESeq2","AnnotationDbi","org.Hs.eg.db","clusterProfiler",
+  "hgu133plus2.db","GEOquery","limma"
+)
+for (p in bioc_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p, ask = FALSE, update = FALSE)
+}
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(readr)
+library(tibble)
+
+library(GEOquery)
+library(limma)
+
+library(DESeq2)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(hgu133plus2.db)
+library(clusterProfiler)
+
+library(pROC)
+library(survival)
+library(survminer)
+
+# -----------------------------
+# 1) Project folders
+# -----------------------------
+project <- "Cervical_Cancer_Pipeline"  # change if needed
+
+dir.create(file.path(project, "data_raw"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "data_processed"), showWarnings = FALSE, recursive = TRUE)
+
+dir.create(file.path(project, "results"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "results", "GSE63514"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "results", "GSE63514", "enrichment"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "results", "TCGA"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "results", "TCGA", "figures"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project, "results", "supplementary"), showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------
+# 2) INPUT FILE PATHS (edit these names if yours differ)
+# -----------------------------
+counts_file   <- file.path(project, "data_raw", "TCGA-CESC.star_counts.tsv.gz")
+clinical_file <- file.path(project, "data_raw", "TCGA-CESC.clinical.tsv.gz")
+survival_file <- file.path(project, "data_raw", "TCGA-CESC.survival.tsv.gz")
+
+stopifnot(file.exists(counts_file))
+stopifnot(file.exists(clinical_file))
+stopifnot(file.exists(survival_file))
+
+# -----------------------------
+# 3) TCGA: Import counts + metadata
+# -----------------------------
+counts <- fread(counts_file) %>% as.data.frame()
+gene_ids <- counts[[1]]
+counts_mat <- as.matrix(counts[, -1])
+rownames(counts_mat) <- gene_ids
+
+clinical <- fread(clinical_file) %>% as.data.frame()
+surv     <- fread(survival_file) %>% as.data.frame()
+
+# IMPORTANT: If your key column is not named "sample", change here.
+meta <- data.frame(sample_barcode = colnames(counts_mat)) %>%
+  left_join(clinical, by = c("sample_barcode" = "sample")) %>%
+  left_join(surv,     by = c("sample_barcode" = "sample"))
+
+meta$patient_barcode <- substr(meta$sample_barcode, 1, 12)
+meta <- meta[match(colnames(counts_mat), meta$sample_barcode), ]
+stopifnot(all(meta$sample_barcode == colnames(counts_mat)))
+
+saveRDS(meta, file.path(project, "data_processed", "TCGA_CESC_metadata.rds"))
+write.csv(meta, file.path(project, "data_processed", "TCGA_CESC_metadata.csv"), row.names = FALSE)
+
+# -----------------------------
+# 4) TCGA: Filter + DESeq2 normalization (no DE testing)
+# -----------------------------
+keep <- rowSums(counts_mat >= 10) >= ceiling(0.20 * ncol(counts_mat))
+counts_filt <- counts_mat[keep, ]
+message("TCGA genes pre-filter: ", nrow(counts_mat), " | post-filter: ", nrow(counts_filt))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts_filt),
+  colData   = data.frame(row.names = colnames(counts_filt)),
+  design    = ~ 1
+)
+
+dds <- estimateSizeFactors(dds)
+norm_counts_tcga <- counts(dds, normalized = TRUE)
+
+saveRDS(norm_counts_tcga, file.path(project, "data_processed", "TCGA_CESC_norm_counts.rds"))
+
+# -----------------------------
+# 5) TCGA: Map Ensembl -> SYMBOL and collapse duplicates (gene symbol matrix)
+# -----------------------------
+genes_stripped <- gsub("\\..*$", "", rownames(norm_counts_tcga))
+sym_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys     = genes_stripped,
+  columns  = c("SYMBOL"),
+  keytype  = "ENSEMBL"
+)
+sym_map <- sym_map[match(genes_stripped, sym_map$ENSEMBL), ]
+gene_symbol_vec <- sym_map$SYMBOL
+
+valid_rows <- !is.na(gene_symbol_vec) & gene_symbol_vec != ""
+expr_mat <- norm_counts_tcga[valid_rows, ]
+symbols  <- gene_symbol_vec[valid_rows]
+
+expr_tcga_sym <- rowsum(as.matrix(expr_mat), group = symbols)  # genes x samples
+saveRDS(expr_tcga_sym, file.path(project, "data_processed", "TCGA_CESC_expr_by_symbol.rds"))
+message("TCGA SYMBOL genes: ", nrow(expr_tcga_sym), " | samples: ", ncol(expr_tcga_sym))
+
+# -----------------------------
+# 6) GEO: Download GSE63514
+# -----------------------------
+gse <- getGEO("GSE63514", GSEMatrix = TRUE)[[1]]
+expr_geo <- exprs(gse)     # probes x samples
+pheno_geo <- pData(gse)
+
+# Define groups from title (edit these if your titles differ)
+sample_title <- pheno_geo$title
+pheno_geo$group <- case_when(
+  str_detect(sample_title, regex("normal", ignore_case = TRUE)) ~ "Normal",
+  str_detect(sample_title, regex("cin", ignore_case = TRUE)) ~ "CIN",
+  str_detect(sample_title, regex("cancer|carcinoma", ignore_case = TRUE)) ~ "Cancer",
+  TRUE ~ NA_character_
+) %>% factor(levels = c("Normal","CIN","Cancer"))
+
+# -----------------------------
+# 7) limma DEG: Cancer vs Normal only
+# -----------------------------
+keep_samples <- which(pheno_geo$group %in% c("Normal","Cancer"))
+expr_nc  <- expr_geo[, keep_samples]
+pheno_nc <- pheno_geo[keep_samples, , drop = FALSE]
+group_nc <- droplevels(pheno_nc$group)
+print(table(group_nc))
+
+design <- model.matrix(~ 0 + group_nc)
+colnames(design) <- levels(group_nc)
+
+fit <- lmFit(expr_nc, design)
+cont <- makeContrasts(Cancer - Normal, levels = design)
+fit2 <- eBayes(contrasts.fit(fit, cont))
+
+deg_all <- topTable(fit2, number = Inf, adjust.method = "BH", sort.by = "P")
+deg_all$probe_id <- rownames(deg_all)
+
+logFC_cutoff <- 1
+adjP_cutoff  <- 0.05
+
+deg_sig <- deg_all %>%
+  filter(abs(logFC) >= logFC_cutoff, adj.P.Val < adjP_cutoff)
+
+write.csv(deg_all, file.path(project, "results", "GSE63514", "GSE63514_limma_all_probes_Normal_vs_Cancer.csv"), row.names = FALSE)
+write.csv(deg_sig, file.path(project, "results", "GSE63514", "GSE63514_limma_sig_probes_Normal_vs_Cancer.csv"), row.names = FALSE)
+
+# Volcano
+deg_all <- deg_all %>%
+  mutate(sig = case_when(
+    adj.P.Val < adjP_cutoff & logFC >=  logFC_cutoff ~ "Up",
+    adj.P.Val < adjP_cutoff & logFC <= -logFC_cutoff ~ "Down",
+    TRUE ~ "NS"
+  ))
+
+p_volcano <- ggplot(deg_all, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = sig), alpha = 0.7, size = 1.1) +
+  scale_color_manual(values = c(Up = "#E64B35", Down = "#4DBBD5", NS = "grey70")) +
+  theme_bw(base_size = 14) +
+  labs(title = "GSE63514: Volcano plot (Cancer vs Normal)", x = "log2 fold-change", y = "-log10(FDR)")
+
+ggsave(file.path(project, "results", "GSE63514", "GSE63514_volcano_Normal_vs_Cancer.png"),
+       p_volcano, width = 7, height = 6, dpi = 600)
+
+# -----------------------------
+# 8) Probe annotation -> SYMBOL + ENTREZ
+# -----------------------------
+ann_all <- AnnotationDbi::select(
+  hgu133plus2.db,
+  keys     = rownames(expr_geo),
+  columns  = c("SYMBOL","ENTREZID"),
+  keytype  = "PROBEID"
+)
+
+deg_sig_ann <- deg_sig %>%
+  left_join(ann_all, by = c("probe_id" = "PROBEID")) %>%
+  filter(!is.na(ENTREZID))
+
+up_entrez   <- unique(deg_sig_ann$ENTREZID[deg_sig_ann$logFC > 0])
+down_entrez <- unique(deg_sig_ann$ENTREZID[deg_sig_ann$logFC < 0])
+
+bg_entrez <- ann_all %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(ENTREZID) %>%
+  pull(ENTREZID)
+
+# -----------------------------
+# 9) Enrichment: GO BP + KEGG (Up and Down separately)
+# -----------------------------
+ego_up <- enrichGO(
+  gene = up_entrez, universe = bg_entrez,
+  OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+ego_dn <- enrichGO(
+  gene = down_entrez, universe = bg_entrez,
+  OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP",
+  pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+ekegg_up <- enrichKEGG(gene = up_entrez, organism = "hsa", pvalueCutoff = 0.05)
+ekegg_dn <- enrichKEGG(gene = down_entrez, organism = "hsa", pvalueCutoff = 0.05)
+
+ekegg_up <- setReadable(ekegg_up, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+ekegg_dn <- setReadable(ekegg_dn, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+
+write.csv(as.data.frame(ego_up),  file.path(project, "results", "GSE63514", "enrichment", "GSE63514_GO_BP_up.csv"), row.names = FALSE)
+write.csv(as.data.frame(ego_dn),  file.path(project, "results", "GSE63514", "enrichment", "GSE63514_GO_BP_down.csv"), row.names = FALSE)
+write.csv(as.data.frame(ekegg_up),file.path(project, "results", "GSE63514", "enrichment", "GSE63514_KEGG_up.csv"), row.names = FALSE)
+write.csv(as.data.frame(ekegg_dn),file.path(project, "results", "GSE63514", "enrichment", "GSE63514_KEGG_down.csv"), row.names = FALSE)
+
+ggsave(file.path(project, "results", "GSE63514", "enrichment", "GSE63514_GO_BP_up_dotplot.png"),
+       dotplot(ego_up, showCategory = 20) + ggtitle("GO BP (Upregulated)"),
+       width = 9, height = 6, dpi = 600)
+
+ggsave(file.path(project, "results", "GSE63514", "enrichment", "GSE63514_GO_BP_down_dotplot.png"),
+       dotplot(ego_dn, showCategory = 20) + ggtitle("GO BP (Downregulated)"),
+       width = 9, height = 6, dpi = 600)
+
+ggsave(file.path(project, "results", "GSE63514", "enrichment", "GSE63514_KEGG_up_dotplot.png"),
+       dotplot(ekegg_up, showCategory = 20) + ggtitle("KEGG (Upregulated)"),
+       width = 9, height = 6, dpi = 600)
+
+ggsave(file.path(project, "results", "GSE63514", "enrichment", "GSE63514_KEGG_down_dotplot.png"),
+       dotplot(ekegg_dn, showCategory = 20) + ggtitle("KEGG (Downregulated)"),
+       width = 9, height = 6, dpi = 600)
+
+# -----------------------------
+# 10) Gene-level DEG table + overlap with TCGA (the correct way)
+# -----------------------------
+df_gene_gse <- deg_sig_ann %>%
+  filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    logFC_max_abs = max(abs(logFC), na.rm = TRUE),
+    logFC_mean    = mean(logFC, na.rm = TRUE),
+    FDR_min       = min(adj.P.Val, na.rm = TRUE),
+    direction     = ifelse(logFC_mean > 0, "Up", "Down"),
+    n_probes      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(FDR_min)
+
+write.csv(df_gene_gse,
+          file.path(project, "results", "GSE63514", "GSE63514_DEG_gene_level_Normal_vs_Cancer.csv"),
+          row.names = FALSE)
+
+genes_gse  <- unique(df_gene_gse$SYMBOL)
+genes_tcga <- rownames(expr_tcga_sym)
+
+overlap_tbl <- df_gene_gse %>%
+  filter(SYMBOL %in% intersect(genes_gse, genes_tcga)) %>%
+  arrange(FDR_min)
+
+write.csv(overlap_tbl,
+          file.path(project, "results", "GSE63514", "GSE63514_DEG_gene_level_overlapping_TCGA.csv"),
+          row.names = FALSE)
+
+message("Overlap genes (GSE DEG genes present in TCGA): ", nrow(overlap_tbl))
+
+# -----------------------------
+# 11) ANO10 co-expression (TCGA): top 20 plot + top 100 supplementary table
+# -----------------------------
+candidate_gene <- "ANO10"
+stopifnot(candidate_gene %in% rownames(expr_tcga_sym))
+
+ano10_expr <- as.numeric(expr_tcga_sym[candidate_gene, ])
+
+cor_vec <- apply(expr_tcga_sym, 1, function(g) {
+  cor(g, ano10_expr, method = "spearman", use = "pairwise.complete.obs")
+})
+
+corr_df <- data.frame(gene = rownames(expr_tcga_sym), rho = as.numeric(cor_vec)) %>%
+  filter(!is.na(rho), gene != candidate_gene) %>%
+  arrange(desc(rho))
+
+top20  <- corr_df %>% slice(1:20)
+top100 <- corr_df %>% slice(1:100)
+
+write.csv(top100,
+          file.path(project, "results", "supplementary", "SuppTable_ANO10_top100_correlated_genes.csv"),
+          row.names = FALSE)
+
+p_top20 <- ggplot(top20, aes(x = reorder(gene, rho), y = rho)) +
+  geom_col(fill = "#3C7FB1") +
+  coord_flip() +
+  theme_bw(base_size = 14) +
+  labs(title = "Top 20 genes positively correlated with ANO10 (TCGA-CESC)",
+       x = "Gene", y = "Spearman correlation (ρ)")
+
+ggsave(file.path(project, "results", "TCGA", "figures", "TCGA_ANO10_top20_correlated_genes.png"),
+       p_top20, width = 8, height = 6, dpi = 600)
+
+# -----------------------------
+# 12) Immune checkpoint comparison (ANO10-High vs ANO10-Low)
+# -----------------------------
+ano10_cutoff <- median(ano10_expr, na.rm = TRUE)
+ano10_group <- factor(ifelse(ano10_expr >= ano10_cutoff, "High", "Low"),
+                      levels = c("Low","High"))
+
+immune_genes <- c("CD274","PDCD1","CTLA4","LAG3","TIGIT","HAVCR2","CXCL9","CXCL10","CXCL13","IDO1")
+immune_genes_present <- immune_genes[immune_genes %in% rownames(expr_tcga_sym)]
+
+message("Immune genes present in TCGA matrix: ", paste(immune_genes_present, collapse = ", "))
+
+immune_expr <- expr_tcga_sym[immune_genes_present, , drop = FALSE]  # genes x samples
+
+immune_long <- as.data.frame(t(immune_expr))  # samples x genes
+immune_long$sample <- rownames(immune_long)
+immune_long$ANO10_group <- ano10_group[match(immune_long$sample, colnames(expr_tcga_sym))]
+
+immune_long2 <- immune_long %>%
+  pivot_longer(cols = all_of(immune_genes_present), names_to = "gene", values_to = "expression") %>%
+  filter(!is.na(ANO10_group))
+
+p_immune <- ggplot(immune_long2, aes(x = gene, y = expression, fill = ANO10_group)) +
+  geom_boxplot(outlier.size = 0.6) +
+  scale_fill_manual(values = c("Low" = "#F8766D", "High" = "#00BFC4"), name = "ANO10 group") +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1)) +
+  labs(title = "Immune checkpoint expression in ANO10-High vs ANO10-Low tumors (TCGA-CESC)",
+       x = "Gene", y = "Normalized expression")
+
+ggsave(file.path(project, "results", "TCGA", "figures", "TCGA_ANO10_immune_checkpoints.png"),
+       p_immune, width = 10, height = 6, dpi = 600)
+
+immune_stats <- immune_long2 %>%
+  group_by(gene) %>%
+  summarise(
+    median_Low  = median(expression[ANO10_group == "Low"], na.rm = TRUE),
+    median_High = median(expression[ANO10_group == "High"], na.rm = TRUE),
+    p_value = wilcox.test(expression ~ ANO10_group)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_value)
+
+write.csv(immune_stats,
+          file.path(project, "results", "supplementary", "SuppTable_ANO10_immune_checkpoints_Wilcoxon.csv"),
+          row.names = FALSE)
+
+message("DONE. Check results folder: ", file.path(project, "results"))
