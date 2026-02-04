@@ -1,23 +1,10 @@
-# R-Biomarker: Cervical Cancer Pipeline (GSE63514 + TCGA-CESC) — ANO10 Study
-
-[![R](https://img.shields.io/badge/R-4.5.1-blue)](https://www.r-project.org/) [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-
-This repository contains an **R-based biomarker identification pipeline** for cervical cancer transcriptomics. It integrates **GSE63514 (GEO microarray)** and **TCGA-CESC (RNA-seq)** datasets, focusing on **differential expression analysis, functional enrichment, ANO10 co-expression**, and **immune checkpoint analysis**.
-
----
-
-## 🔹 Features
-
-- Preprocess and normalize **TCGA-CESC RNA-seq counts** (DESeq2).  
-- Download and analyze **GSE63514 microarray data**.  
-- Perform **DEG analysis (Cancer vs Normal)** using **limma**.  
-- Annotate probes to **gene symbols and Entrez IDs**.  
-- Conduct **GO BP & KEGG pathway enrichment** for up- and down-regulated genes.  
-- Identify **overlapping DEGs** between GSE63514 and TCGA-CESC.  
-- Compute **ANO10 co-expression** and visualize top correlated genes.  
-- Compare **immune checkpoint gene expression** between ANO10-High vs ANO10-Low groups.  
-
----
-
-## 🔹 Project Structure
-
+Cervical_Cancer_Pipeline/
+│
+├─ data_raw/                 # Raw input files (TCGA counts, clinical, survival)
+├─ data_processed/           # Normalized & processed RNA-seq/microarray data
+├─ results/
+│   ├─ GSE63514/             # DEG & enrichment results, volcano & dotplots
+│   ├─ TCGA/figures/         # ANO10 co-expression & immune checkpoint plots
+│   └─ supplementary/        # Top ANO10 correlated genes & immune stats
+├─ Cervical_Cancer_Pipeline.R # Full R analysis script
+└─ README.md
